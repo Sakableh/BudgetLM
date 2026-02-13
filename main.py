@@ -336,6 +336,7 @@ def build_summary(pending: PendingTransaction) -> str:
         f"Type: {'Income' if pending.is_received else 'Expense'}",
         f"Account: {pending.account_name}",
         f"Category: {pending.category_name or 'Uncategorized'}",
+        "Lunch Money status: Uncleared (requires approval/review)",
         "",
         f"Original text: {pending.original_text}",
     ]
@@ -350,7 +351,7 @@ def insert_transaction(client: LunchMoney, pending: PendingTransaction) -> int:
         payee=pending.payee,
         amount=signed_amount,
         currency=pending.currency.lower(),
-        status=TransactionInsertObject.StatusEnum.cleared,
+        status=TransactionInsertObject.StatusEnum.uncleared,
         asset_id=pending.account_id,
     )
 
@@ -515,9 +516,14 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     await update.callback_query.answer("Saved")
     if update.callback_query.message:
-        await update.callback_query.message.reply_text(f"Saved transaction in Lunch Money (id {tx_id}).")
+        await update.callback_query.message.reply_text(
+            f"Saved transaction in Lunch Money (id {tx_id}) as uncleared for approval/review."
+        )
     else:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Saved transaction (id {tx_id}).")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"Saved transaction (id {tx_id}) as uncleared for approval/review.",
+        )
 
 
 async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

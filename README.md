@@ -109,6 +109,10 @@ Lunch 12.50 yesterday cash at Subway
 The bot replies with a summary and inline buttons to confirm or cancel.
 You can send `/accounts` to list account names and IDs from Lunch Money.
 
+Behavior notes:
+- Notes are not parsed or sent.
+- Confirmed transactions are inserted as `uncleared`, so they still require approval/review in Lunch Money.
+
 ## Environment
 
 - TELEGRAM_BOT_TOKEN
