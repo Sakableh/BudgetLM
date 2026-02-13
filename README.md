@@ -107,6 +107,7 @@ Lunch 12.50 yesterday cash at Subway
 ```
 
 The bot replies with a summary and inline buttons to confirm or cancel.
+You can send `/accounts` to list account names and IDs from Lunch Money.
 
 ## Environment
 
@@ -116,3 +117,15 @@ The bot replies with a summary and inline buttons to confirm or cancel.
 - TIMEZONE (default UTC)
 - DEFAULT_CURRENCY (default USD)
 - DEFAULT_ACCOUNT_ID (optional, fallback account)
+
+## Troubleshooting
+
+If you get:
+
+`Could not match an account. Include one of your account names in the message, or set DEFAULT_ACCOUNT_ID.`
+
+Use one of these fixes:
+- Include the account name in your message (for example: `Lunch 12.50 cash`).
+- Send `/accounts` in Telegram and copy either:
+  - the exact account name into your transaction text, or
+  - the account ID into `.env` as `DEFAULT_ACCOUNT_ID=123456`.

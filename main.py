@@ -93,8 +93,14 @@ def list_categories(client: LunchMoney):
     return [category for category in categories if not category.is_group]
 
 
+def _account_label(account) -> str:
+    return account.display_name or account.name
+
+
 def _normalize(value: str) -> str:
-    return " ".join(value.lower().strip().split())
+    # Normalize case, spacing, and punctuation so fuzzy account/category matching is more reliable.
+    normalized = "".join(ch.lower() if ch.isalnum() else " " for ch in value)
+    return " ".join(normalized.strip().split())
 
 
 def match_account(account_name: str | None, accounts) -> tuple[int, str] | None:
@@ -106,28 +112,70 @@ def match_account(account_name: str | None, accounts) -> tuple[int, str] | None:
         account_id = int(trimmed)
         for acct in accounts:
             if acct.id == account_id:
-                return acct.id, acct.display_name or acct.name
+                return acct.id, _account_label(acct)
 
     needle = _normalize(account_name)
     if not needle:
         return None
 
+    needle_tokens = set(needle.split())
     exact = None
     contains = None
+    contained_by = None
+    token_best = None
+    token_best_score = 0
+    token_tie = False
+
     for acct in accounts:
-        name = acct.display_name or acct.name
+        name = _account_label(acct)
         normalized = _normalize(name)
         if normalized == needle:
             exact = acct
             break
         if needle in normalized:
             contains = contains or acct
+        if normalized in needle:
+            contained_by = contained_by or acct
 
-    match = exact or contains
+        overlap = len(set(normalized.split()) & needle_tokens)
+        if overlap > token_best_score:
+            token_best = acct
+            token_best_score = overlap
+            token_tie = False
+        elif overlap and overlap == token_best_score:
+            token_tie = True
+
+    token_match = token_best if token_best_score > 0 and not token_tie else None
+    match = exact or contains or contained_by or token_match
     if not match:
         return None
 
-    return match.id, match.display_name or match.name
+    return match.id, _account_label(match)
+
+
+def resolve_account(account_name: str | None, accounts, default_account_id: int | None) -> tuple[int, str] | None:
+    matched_account = match_account(account_name, accounts)
+    if matched_account:
+        return matched_account
+
+    if default_account_id is not None:
+        by_default_id = next((acct for acct in accounts if acct.id == default_account_id), None)
+        if by_default_id:
+            return by_default_id.id, _account_label(by_default_id)
+
+    if len(accounts) == 1:
+        only = accounts[0]
+        return only.id, _account_label(only)
+
+    return None
+
+
+def format_account_options(accounts, *, limit: int = 10) -> str:
+    options = [f"{_account_label(acct)} (id {acct.id})" for acct in accounts[:limit]]
+    remaining = len(accounts) - limit
+    if remaining > 0:
+        options.append(f"...and {remaining} more")
+    return ", ".join(options)
 
 
 def match_category(category_name: str | None, categories) -> tuple[int, str] | None:
@@ -323,8 +371,31 @@ async def handle_start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text(
         "Send a transaction like: 'Lunch 12.50 yesterday cash at Subway'. "
-        "I will parse it and ask you to confirm before saving."
+        "I will parse it and ask you to confirm before saving. "
+        "Use /accounts to see account names and IDs."
     )
+
+
+async def handle_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    config = context.bot_data.get("config")
+    if not isinstance(config, Config):
+        await update.message.reply_text("Bot configuration error. Check server logs.")
+        return
+
+    client = get_client(config.lunch_money_token)
+    accounts = list_manual_accounts(client)
+    if not accounts:
+        await update.message.reply_text(
+            "No manual accounts found in Lunch Money. Add a cash or credit account before using this bot."
+        )
+        return
+
+    lines = ["Manual accounts:"]
+    lines.extend(f"- {_account_label(acct)} (id {acct.id})" for acct in accounts)
+    await update.message.reply_text("\n".join(lines))
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -350,7 +421,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    account_names = [acct.display_name or acct.name for acct in accounts]
+    account_names = [_account_label(acct) for acct in accounts]
     category_names = [category.name for category in categories]
 
     try:
@@ -384,16 +455,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     parsed_date = _parse_date(_safe_str(result.get("date")), config.timezone)
 
-    matched_account = match_account(account_name, accounts)
-    if matched_account is None and config.default_account_id:
-        matched_account = next(
-            ((acct.id, acct.display_name or acct.name) for acct in accounts if acct.id == config.default_account_id),
-            None,
-        )
+    matched_account = resolve_account(account_name, accounts, config.default_account_id)
 
     if matched_account is None:
         await update.message.reply_text(
-            "Could not match an account. Please include the account name, or set DEFAULT_ACCOUNT_ID."
+            "Could not match an account. Include one of your account names in the message, "
+            "or set DEFAULT_ACCOUNT_ID.\n"
+            f"Available accounts: {format_account_options(accounts)}"
         )
         return
 
@@ -481,6 +549,7 @@ async def main() -> None:
 
     application.add_handler(CommandHandler("start", handle_start))
     application.add_handler(CommandHandler("help", handle_start))
+    application.add_handler(CommandHandler("accounts", handle_accounts))
     application.add_handler(CallbackQueryHandler(handle_confirm, pattern=f"^{CONFIRM_CALLBACK}$"))
     application.add_handler(CallbackQueryHandler(handle_cancel, pattern=f"^{CANCEL_CALLBACK}$"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
