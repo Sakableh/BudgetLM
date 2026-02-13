@@ -43,7 +43,6 @@ class PendingTransaction:
     account_name: str
     category_id: int | None
     category_name: str | None
-    notes: str | None
     is_received: bool
 
 
@@ -263,7 +262,6 @@ def parse_transaction_text(
         "payee": "string",
         "account": "string or null",
         "category": "string or null",
-        "notes": "string or null",
         "is_received": "boolean",
         "confidence": "number between 0 and 1",
         "missing_fields": ["date", "amount", "payee", "account"],
@@ -338,7 +336,6 @@ def build_summary(pending: PendingTransaction) -> str:
         f"Type: {'Income' if pending.is_received else 'Expense'}",
         f"Account: {pending.account_name}",
         f"Category: {pending.category_name or 'Uncategorized'}",
-        f"Notes: {pending.notes or '-'}",
         "",
         f"Original text: {pending.original_text}",
     ]
@@ -353,7 +350,6 @@ def insert_transaction(client: LunchMoney, pending: PendingTransaction) -> int:
         payee=pending.payee,
         amount=signed_amount,
         currency=pending.currency.lower(),
-        notes=pending.notes,
         status=TransactionInsertObject.StatusEnum.cleared,
         asset_id=pending.account_id,
     )
@@ -443,7 +439,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     currency = _safe_str(result.get("currency")) or config.default_currency
     account_name = _safe_str(result.get("account"))
     category_name = _safe_str(result.get("category"))
-    notes = _safe_str(result.get("notes"))
     is_received = bool(result.get("is_received"))
 
     if not payee:
@@ -478,7 +473,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         account_name=matched_account[1],
         category_id=matched_category[0] if matched_category else None,
         category_name=matched_category[1] if matched_category else None,
-        notes=notes,
         is_received=is_received,
     )
 
