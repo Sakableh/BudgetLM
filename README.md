@@ -45,6 +45,59 @@ Notes:
 - This bot uses long polling, so you do not need to expose any ports.
 - Keep your `.env` file private.
 
+## Proxmox + Debian + Dockge (GitHub Deploy)
+
+These steps assume you have Docker + Dockge running on your Debian VM/CT in Proxmox.
+
+1. SSH into your Debian host.
+2. Create the app directory:
+
+```
+sudo mkdir -p /opt/BudgetLM
+sudo chown $USER:$USER /opt/BudgetLM
+```
+
+3. Clone your repo into `/opt/BudgetLM`:
+
+```
+git clone https://github.com/Sakableh/BudgetLM.git /opt/BudgetLM
+```
+
+4. Go to the bot folder:
+
+```
+cd /opt/BudgetLM/manual_tx_only_bot
+```
+
+5. Create and edit `.env`:
+
+```
+cp .env.example .env
+nano .env
+```
+
+Recommended values (example):
+```
+TIMEZONE=Asia/Singapore
+DEFAULT_CURRENCY=BND
+```
+
+6. Open Dockge UI:
+   - Click “Create Stack”
+   - Choose the folder: `/opt/BudgetLM/manual_tx_only_bot`
+   - Dockge will detect `docker-compose.yml`
+   - Click “Deploy”
+
+7. Verify logs in Dockge (stack → Logs) or via SSH:
+
+```
+docker compose logs -f
+```
+
+Notes:
+- Do not commit `.env` to GitHub.
+- No ports need to be exposed (long polling).
+
 ## Usage
 
 Send a message like:
