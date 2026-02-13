@@ -108,10 +108,15 @@ Lunch 12.50 yesterday cash at Subway
 
 The bot replies with a summary and inline buttons to confirm or cancel.
 You can send `/accounts` to list account names and IDs from Lunch Money.
+You can send `/accountmap` to verify message-token to account mappings.
 
 Behavior notes:
 - Notes are not parsed or sent.
 - Confirmed transactions are inserted as `uncleared`, so they still require approval/review in Lunch Money.
+- Bot inserts are sent with `apply_rules=false` to avoid rule-based auto changes during creation.
+- If incoming text includes mapped card/account tokens (for example `2831`), the mapped account ID is used.
+- If Lunch Money still auto-marks them reviewed, disable auto-review in:
+  `Settings -> User Preferences -> Transaction Preferences`.
 
 ## Environment
 
@@ -121,6 +126,13 @@ Behavior notes:
 - TIMEZONE (default UTC)
 - DEFAULT_CURRENCY (default USD)
 - DEFAULT_ACCOUNT_ID (optional, fallback account)
+- ACCOUNT_TOKEN_MAP (optional token->account mapping from message text)
+
+Example mapping:
+```
+ACCOUNT_TOKEN_MAP=2831:1234,9912:5678
+```
+If your text contains `2831`, the bot will use account id `1234`.
 
 ## Troubleshooting
 
@@ -133,3 +145,4 @@ Use one of these fixes:
 - Send `/accounts` in Telegram and copy either:
   - the exact account name into your transaction text, or
   - the account ID into `.env` as `DEFAULT_ACCOUNT_ID=123456`.
+- If your bank alerts include card/account suffixes, map them with `ACCOUNT_TOKEN_MAP` and verify with `/accountmap`.

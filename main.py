@@ -2,13 +2,14 @@ import asyncio
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from lunchable import LunchMoney, TransactionInsertObject
+from lunchable import LunchMoney, TransactionInsertObject, TransactionUpdateObject
 from openai import OpenAI
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
@@ -29,6 +30,7 @@ class Config:
     timezone: str
     default_currency: str
     default_account_id: int | None
+    account_token_map: dict[str, int]
 
 
 @dataclass
@@ -54,6 +56,7 @@ def load_config() -> Config:
 
     default_account_raw = os.getenv("DEFAULT_ACCOUNT_ID", "").strip()
     default_account_id = int(default_account_raw) if default_account_raw.isdigit() else None
+    account_token_map = _parse_account_token_map(os.getenv("ACCOUNT_TOKEN_MAP", ""))
 
     return Config(
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
@@ -62,6 +65,7 @@ def load_config() -> Config:
         timezone=os.getenv("TIMEZONE", "UTC").strip() or "UTC",
         default_currency=os.getenv("DEFAULT_CURRENCY", "USD").strip() or "USD",
         default_account_id=default_account_id,
+        account_token_map=account_token_map,
     )
 
 
@@ -94,6 +98,67 @@ def list_categories(client: LunchMoney):
 
 def _account_label(account) -> str:
     return account.display_name or account.name
+
+
+def _parse_account_token_map(raw: str) -> dict[str, int]:
+    cleaned = raw.strip()
+    if not cleaned:
+        return {}
+
+    # Preferred format: JSON object {"2831":1234,"9912":5678}
+    if cleaned.startswith("{"):
+        try:
+            payload = json.loads(cleaned)
+        except json.JSONDecodeError:
+            logger.warning("Invalid ACCOUNT_TOKEN_MAP JSON; expected object like {\"2831\":1234}")
+            return {}
+
+        if not isinstance(payload, dict):
+            logger.warning("Invalid ACCOUNT_TOKEN_MAP JSON; expected object mapping token -> account_id")
+            return {}
+
+        parsed: dict[str, int] = {}
+        for token, account_id in payload.items():
+            token_str = str(token).strip()
+            account_id_str = str(account_id).strip()
+            if token_str and account_id_str.isdigit():
+                parsed[token_str] = int(account_id_str)
+            else:
+                logger.warning("Skipping invalid ACCOUNT_TOKEN_MAP entry: %s -> %s", token, account_id)
+        return parsed
+
+    # Fallback format: 2831:1234,9912:5678
+    parsed: dict[str, int] = {}
+    for item in cleaned.split(","):
+        pair = item.strip()
+        if not pair:
+            continue
+        if ":" not in pair:
+            logger.warning("Skipping invalid ACCOUNT_TOKEN_MAP item (missing colon): %s", pair)
+            continue
+        token, account_id_raw = pair.split(":", 1)
+        token = token.strip()
+        account_id_raw = account_id_raw.strip()
+        if not token or not account_id_raw.isdigit():
+            logger.warning("Skipping invalid ACCOUNT_TOKEN_MAP item: %s", pair)
+            continue
+        parsed[token] = int(account_id_raw)
+
+    return parsed
+
+
+def _find_text_tokens(text: str) -> set[str]:
+    # Capture common "card ending 1234" variants while also allowing plain 4-digit token matches.
+    found: set[str] = set(re.findall(r"(?<!\d)(\d{4})(?!\d)", text))
+
+    for pattern in (
+        r"(?:ending|ends\s+with|last\s*4|last4)\D{0,8}(\d{4})",
+        r"(?:card|visa|mastercard|amex|debit|credit|acct|account)\D{0,24}(\d{4})",
+        r"(?:x{2,}|\*{2,}|#{2,}|•{2,}|XX+)\s*(\d{4})",
+    ):
+        found.update(match for match in re.findall(pattern, text, flags=re.IGNORECASE))
+
+    return found
 
 
 def _normalize(value: str) -> str:
@@ -167,6 +232,34 @@ def resolve_account(account_name: str | None, accounts, default_account_id: int 
         return only.id, _account_label(only)
 
     return None
+
+
+def resolve_account_from_text_tokens(text: str, accounts, token_map: dict[str, int]) -> tuple[int, str] | None:
+    if not token_map:
+        return None
+
+    text_tokens = _find_text_tokens(text)
+    if not text_tokens:
+        return None
+
+    mapped_ids = {account_id for token, account_id in token_map.items() if token in text_tokens}
+    if not mapped_ids:
+        return None
+
+    if len(mapped_ids) > 1:
+        logger.info("Multiple ACCOUNT_TOKEN_MAP matches found in text; skipping map-based account selection")
+        return None
+
+    account_id = next(iter(mapped_ids))
+    account = next((acct for acct in accounts if acct.id == account_id), None)
+    if account is None:
+        logger.warning(
+            "ACCOUNT_TOKEN_MAP matched account_id %s, but it is not a manual cash/credit account in Lunch Money",
+            account_id,
+        )
+        return None
+
+    return account.id, _account_label(account)
 
 
 def format_account_options(accounts, *, limit: int = 10) -> str:
@@ -343,7 +436,7 @@ def build_summary(pending: PendingTransaction) -> str:
     return "\n".join(lines)
 
 
-def insert_transaction(client: LunchMoney, pending: PendingTransaction) -> int:
+def insert_transaction(client: LunchMoney, pending: PendingTransaction) -> tuple[int, bool]:
     signed_amount = -abs(pending.amount) if pending.is_received else abs(pending.amount)
     tx_object = TransactionInsertObject(
         date=pending.date,
@@ -355,11 +448,20 @@ def insert_transaction(client: LunchMoney, pending: PendingTransaction) -> int:
         asset_id=pending.account_id,
     )
 
-    tx_ids = client.insert_transactions(tx_object)
+    tx_ids = client.insert_transactions(tx_object, apply_rules=False)
     if not tx_ids:
         raise RuntimeError("Lunch Money did not return a transaction id")
 
-    return int(tx_ids[0])
+    tx_id = int(tx_ids[0])
+
+    # Force newly-created manual transactions to stay unreviewed.
+    status_update = TransactionUpdateObject(status=TransactionUpdateObject.StatusEnum.uncleared)
+    try:
+        client.update_transaction(transaction_id=tx_id, transaction=status_update)
+        return tx_id, True
+    except Exception:
+        logger.exception("Inserted transaction %s but failed to force uncleared status", tx_id)
+        return tx_id, False
 
 
 async def handle_start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -369,7 +471,8 @@ async def handle_start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Send a transaction like: 'Lunch 12.50 yesterday cash at Subway'. "
         "I will parse it and ask you to confirm before saving. "
-        "Use /accounts to see account names and IDs."
+        "Use /accounts to see account names and IDs. "
+        "Use /accountmap to verify card-token mappings."
     )
 
 
@@ -392,6 +495,36 @@ async def handle_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     lines = ["Manual accounts:"]
     lines.extend(f"- {_account_label(acct)} (id {acct.id})" for acct in accounts)
+    await update.message.reply_text("\n".join(lines))
+
+
+async def handle_accountmap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    config = context.bot_data.get("config")
+    if not isinstance(config, Config):
+        await update.message.reply_text("Bot configuration error. Check server logs.")
+        return
+
+    if not config.account_token_map:
+        await update.message.reply_text(
+            "ACCOUNT_TOKEN_MAP is empty. Configure it in .env, for example: ACCOUNT_TOKEN_MAP=2831:1234,9912:5678"
+        )
+        return
+
+    client = get_client(config.lunch_money_token)
+    accounts = list_manual_accounts(client)
+    account_by_id = {acct.id: _account_label(acct) for acct in accounts}
+
+    lines = ["Configured account token map:"]
+    for token, account_id in sorted(config.account_token_map.items()):
+        account_label = account_by_id.get(account_id)
+        if account_label:
+            lines.append(f"- {token} -> {account_label} (id {account_id})")
+        else:
+            lines.append(f"- {token} -> id {account_id} (not found in manual cash/credit accounts)")
+
     await update.message.reply_text("\n".join(lines))
 
 
@@ -451,7 +584,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     parsed_date = _parse_date(_safe_str(result.get("date")), config.timezone)
 
-    matched_account = resolve_account(account_name, accounts, config.default_account_id)
+    mapped_account = resolve_account_from_text_tokens(text, accounts, config.account_token_map)
+    matched_account = mapped_account or resolve_account(account_name, accounts, config.default_account_id)
 
     if matched_account is None:
         await update.message.reply_text(
@@ -506,7 +640,7 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     client = get_client(config.lunch_money_token)
 
     try:
-        tx_id = insert_transaction(client, pending)
+        tx_id, forced_unreviewed = insert_transaction(client, pending)
     except Exception:
         logger.exception("Failed to insert transaction")
         await update.callback_query.answer("Failed to save transaction. Check logs.", show_alert=True)
@@ -515,14 +649,20 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     clear_pending(update.effective_chat.id)
 
     await update.callback_query.answer("Saved")
-    if update.callback_query.message:
-        await update.callback_query.message.reply_text(
-            f"Saved transaction in Lunch Money (id {tx_id}) as uncleared for approval/review."
+    if forced_unreviewed:
+        saved_text = f"Saved transaction in Lunch Money (id {tx_id}) as uncleared for approval/review."
+    else:
+        saved_text = (
+            f"Saved transaction in Lunch Money (id {tx_id}), but it may still appear reviewed.\n"
+            "In Lunch Money, disable auto-review settings for manual creation/updates and check Rules."
         )
+
+    if update.callback_query.message:
+        await update.callback_query.message.reply_text(saved_text)
     else:
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text=f"Saved transaction (id {tx_id}) as uncleared for approval/review.",
+            text=saved_text,
         )
 
 
@@ -550,6 +690,7 @@ async def main() -> None:
     application.add_handler(CommandHandler("start", handle_start))
     application.add_handler(CommandHandler("help", handle_start))
     application.add_handler(CommandHandler("accounts", handle_accounts))
+    application.add_handler(CommandHandler("accountmap", handle_accountmap))
     application.add_handler(CallbackQueryHandler(handle_confirm, pattern=f"^{CONFIRM_CALLBACK}$"))
     application.add_handler(CallbackQueryHandler(handle_cancel, pattern=f"^{CANCEL_CALLBACK}$"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
